@@ -69,15 +69,25 @@ lab.y+=split*.10;lab.z+=split*.35*(2.*smoothstep(.25,.85,lab.x)-1.);
 // Optional smooth palette shaping; never quantize hues or tint neutral pixels.
 if(stylize>0.){
  float C=length(lab.yz);float h=atan(lab.z,lab.y);
- float mask=smoothstep(.025,.085,C)*smoothstep(.12,.30,lab.x)*(1.-smoothstep(.85,.98,lab.x));
- // Soft color-range skin protection is approximate (not semantic face detection).
- float skin=hueWeight(h,.88,.42)*smoothstep(.25,.45,lab.x)*(1.-smoothstep(.85,.98,lab.x));
- float k=stylize*mask*(1.-.85*skin);
- float green=hueWeight(h,2.30,.48);float blue=hueWeight(h,-1.78,.42);float purple=hueWeight(h,-.85,.38);
- float shift=.28*green*angleDelta(2.53,h)+.24*blue*angleDelta(-1.98,h)+.30*purple*angleDelta(-.88,h);
- h+=k*shift;
- float gain=1.+k*(.12*green+.16*blue+.12*purple)*(1.-smoothstep(.16,.30,C));
- C*=gain;lab.x+=k*(-.018*blue+.008*purple);
+ float mask=smoothstep(.018,.065,C)*smoothstep(.08,.25,lab.x)*(1.-smoothstep(.88,.99,lab.x));
+ // Approximate skin-color protection; orange objects share this protection.
+ float skin=hueWeight(h,.88,.36)*smoothstep(.25,.45,lab.x)*(1.-smoothstep(.85,.98,lab.x));
+ float k=stylize*mask*(1.-.75*skin);
+ // OKLCh hue anchors in radians: red, orange, yellow, green, cyan, blue, purple, magenta.
+ const float centers[8]=float[8](.44,1.05,1.66,2.36,-2.88,-1.83,-.96,-.26);
+ const float targets[8]=float[8](.51,.94,1.57,2.60,-2.70,-1.99,-.79,-.12);
+ const float boosts[8]=float[8](.28,.22,.20,.34,.30,.38,.34,.30);
+ const float lights[8]=float[8](-.008,.012,.015,-.012,-.010,-.035,.008,.005);
+ float shift=0.;float boost=0.;float light=0.;float weights=0.;
+ for(int i=0;i<8;i++){
+  float w=hueWeight(h,centers[i],.31);
+  shift+=w*angleDelta(targets[i],h);boost+=w*boosts[i];light+=w*lights[i];weights+=w;
+ }
+ float norm=max(weights,1.);
+ // Smooth bounded rotation retains gradients instead of snapping to palette entries.
+ h+=clamp(.80*k*shift/norm,-.40,.40);
+ C*=1.+k*boost/norm*(1.-.65*smoothstep(.16,.30,C));
+ lab.x+=k*light/norm;
  lab.yz=C*vec2(cos(h),sin(h));
 }
 // Compress chroma toward a neutral of the same lightness, instead of clipping channels.
@@ -195,7 +205,7 @@ def main():
     ap.add_argument('--max-size',type=int,default=0,help='最长边；0 保留原尺寸，256 适合当前小图训练')
     ap.add_argument('--recursive',action='store_true',help='递归目录，保留子目录结构')
     ap.add_argument('--overwrite',action='store_true')
-    ap.add_argument('--stylize',action='store_true',help='开启额外色相塑形：绿/蓝/紫归拢及选择性色度增强；默认关闭')
+    ap.add_argument('--stylize',action='store_true',help='开启较强的红/橙/黄/绿/青/蓝/紫/洋红色相塑形；默认关闭')
     ap.add_argument('--save-json',action='store_true',help='显式保存同名 JSON 参数记录，默认不输出')
     ap.add_argument('--backend',choices=['auto','egl','default'],default='auto')
     ap.add_argument('--allow-software',action='store_true',help='允许 Mesa 软件渲染，仅用于测试')
@@ -242,7 +252,7 @@ def main():
             save_started=time.perf_counter()
             result.save(dest,format="JPEG",quality=85,subsampling=2,icc_profile=srgb)
             save_seconds=time.perf_counter()-save_started
-            record=dict(algorithm='shader-retouch-v2.1',input=str(path),output=str(dest),size=list(image.size),style=args.style,stylize=args.stylize,strength=args.strength,sharpness=args.sharpness,exposure_offset=args.exposure,renderer=renderer,parameters=params,save_seconds=save_seconds,seconds=time.perf_counter()-start)
+            record=dict(algorithm='shader-retouch-v2.2',input=str(path),output=str(dest),size=list(image.size),style=args.style,stylize=args.stylize,strength=args.strength,sharpness=args.sharpness,exposure_offset=args.exposure,renderer=renderer,parameters=params,save_seconds=save_seconds,seconds=time.perf_counter()-start)
             if args.save_json:
                 metadata.write_text(json.dumps(record,ensure_ascii=False,indent=2),encoding='utf-8')
             print(f'完成 {record["seconds"]:.2f}s: {dest}')
