@@ -179,6 +179,7 @@ def main():
     ap.add_argument('--max-size',type=int,default=0,help='最长边；0 保留原尺寸，256 适合当前小图训练')
     ap.add_argument('--recursive',action='store_true',help='递归目录，保留子目录结构')
     ap.add_argument('--overwrite',action='store_true')
+    ap.add_argument('--save-json',action='store_true',help='显式保存同名 JSON 参数记录，默认不输出')
     ap.add_argument('--backend',choices=['auto','egl','default'],default='auto')
     ap.add_argument('--allow-software',action='store_true',help='允许 Mesa 软件渲染，仅用于测试')
     args=ap.parse_args()
@@ -203,7 +204,7 @@ def main():
         # Keep original extensions in folder mode to prevent same-stem source collisions.
         dest=(output/relative).with_name(relative.name+'_retouched.jpg') if root.is_dir() else path.with_name(path.stem+'_retouched.jpg')
         metadata=dest.with_suffix('.json')
-        if (dest.exists() or metadata.exists()) and not args.overwrite:
+        if (dest.exists() or (args.save_json and metadata.exists())) and not args.overwrite:
             print('跳过已存在:',dest);continue
         start=time.perf_counter()
         try:
@@ -225,7 +226,8 @@ def main():
             result.save(dest,format="JPEG",quality=85,subsampling=2,icc_profile=srgb)
             save_seconds=time.perf_counter()-save_started
             record=dict(algorithm='shader-retouch-v2',input=str(path),output=str(dest),size=list(image.size),style=args.style,strength=args.strength,sharpness=args.sharpness,exposure_offset=args.exposure,renderer=renderer,parameters=params,save_seconds=save_seconds,seconds=time.perf_counter()-start)
-            metadata.write_text(json.dumps(record,ensure_ascii=False,indent=2),encoding='utf-8')
+            if args.save_json:
+                metadata.write_text(json.dumps(record,ensure_ascii=False,indent=2),encoding='utf-8')
             print(f'完成 {record["seconds"]:.2f}s: {dest}')
             if 'timings' in params:print('  分段耗时:', ', '.join(f'{k}={v:.3f}s' for k,v in params['timings'].items()), f', save={save_seconds:.3f}s')
         except Exception as e:
