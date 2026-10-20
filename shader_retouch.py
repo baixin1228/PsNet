@@ -165,6 +165,21 @@ float peak=max(c.r,max(c.g,c.b));
 if(adjustment>0.)adjustment=min(adjustment,max(0.,(1.-peak)*y/max(peak,1e-5))*.9);
 float ny=y+adjustment;c*=max(ny,0.)/max(y,1e-5);imageStore(dst,pos,vec4(clamp(c,0.,1.),1));}''').replace('layout(rgba16f,binding=1)', 'layout(rgba8,binding=1)')
 
+# Validate output on the GPU, avoiding a full CPU scan before JPEG encoding.
+SHARP=SHARP.replace('void main(){pos=ivec2(gl_GlobalInvocationID.xy);sz=imageSize(src);if(any(greaterThanEqual(pos,sz)))return;',
+    'vec3 sharpenAt(ivec2 pixel){pos=pixel;sz=imageSize(src);')
+SHARP=SHARP.replace('imageStore(dst,pos,vec4(clamp(c,0.,1.),1));}', 'return clamp(c,0.,1.);}')
+SHARP+="""
+layout(std430,binding=6) buffer OutputCheck {uint nonzero;};
+shared uint maxima[256];
+void main(){ivec2 pixel=ivec2(gl_GlobalInvocationID.xy);ivec2 size=imageSize(src);
+ bool valid=all(lessThan(pixel,size));vec3 c=vec3(0);
+ if(valid){c=sharpenAt(pixel);imageStore(dst,pixel,vec4(c,1));}
+ uint lane=gl_LocalInvocationIndex;maxima[lane]=uint(round(max(c.r,max(c.g,c.b))*255.));
+ barrier();for(uint stride=128u;stride>0u;stride>>=1u){if(lane<stride)maxima[lane]=max(maxima[lane],maxima[lane+stride]);barrier();}
+ if(lane==0u)atomicMax(nonzero,maxima[0]);}
+"""
+
 def prepare_image(image):
     """Readers decode/pack only; analysis and exposure are computed in shaders."""
     return dict(original_bytes=image.tobytes())
@@ -223,19 +238,20 @@ class ReadbackPixels:
     check_black: bool
 
     def image(self):
-        result=Image.frombytes('RGB',self.size,self.data)
-        if self.check_black and max(channel[1] for channel in result.getextrema())==0:
+        result=Image.frombuffer('RGBX',self.size,self.data,'raw','RGBX',0,1)
+        if self.check_black and max(channel[1] for channel in result.getextrema()[:3])==0:
             raise RuntimeError('GPU 输出全黑，已停止保存')
         return result
 
 
 class PendingReadback:
-    def __init__(self, buffer, size, check_black, exposure=None, params=None, histogram=None):
+    def __init__(self, buffer, size, check_black, exposure=None, params=None, histogram=None, output_check=None):
         self.buffer=buffer
         self.size=size
         self.check_black=check_black
         self.exposure=exposure
         self.histogram=histogram
+        self.output_check=output_check
         self.params=params
 
     def resolve(self):
@@ -246,7 +262,9 @@ class PendingReadback:
                 self.params.update(exposure_ev=float(values[0]),brightness_quantiles=values[1:4].tolist())
             check_black=self.check_black
             if self.histogram is not None:check_black=int.from_bytes(self.histogram.read(size=4,offset=4096*4),'little')>16
-            return ReadbackPixels(data,self.size,check_black)
+            if check_black and self.output_check is not None and int.from_bytes(self.output_check.read(),'little')==0:
+                raise RuntimeError('GPU 输出全黑，已停止保存')
+            return ReadbackPixels(data,self.size,False if self.output_check is not None else check_black)
         finally:self.release()
 
     def release(self):
@@ -256,6 +274,8 @@ class PendingReadback:
             self.exposure.release();self.exposure=None
         if self.histogram is not None:
             self.histogram.release();self.histogram=None
+        if self.output_check is not None:
+            self.output_check.release();self.output_check=None
 
 
 class Retoucher:
@@ -328,6 +348,11 @@ class Retoucher:
         self.ctx.memory_barrier()
 
     def process(self, image, style, strength, exposure_offset, sharpness, stylize=False, prepared=None, defer_readback=False):
+        for identifier,(_,texture) in list(self.texture_pool.items()):
+            if max(texture.size)>768 and texture.size!=image.size:
+                self.texture_pool.pop(identifier)
+                self.texture_pool_bytes-=self.texture_bytes(texture)
+                self.texture_evictions+=1;texture.release()
         prepared=prepare_image(image) if prepared is None else prepared
         params={k:v*strength for k,v in PRESETS[style].items()}
         params['contrast']=1+(PRESETS[style]['contrast']-1)*strength
@@ -394,27 +419,28 @@ class Retoucher:
             self.recycle_texture(colored);textures.remove(colored)
             t=time.perf_counter()
             output=tex((w,h),dtype='f1')
+            output_check=self.ctx.buffer(reserve=4);buffers.append(output_check);output_check.clear()
+            output_check.bind_to_storage_buffer(6)
             self.dispatch('sharp',full,output,amount=sharpness*strength)
             stamp('sharp',t)
             t=time.perf_counter()
-            framebuffer=self.ctx.framebuffer(color_attachments=[output])
             if defer_readback:
                 # GPU pixel-pack buffer: enqueue transfer, submit the next image before mapping it.
-                pack=self.ctx.buffer(reserve=w*h*3)
+                pack=self.ctx.buffer(reserve=w*h*4)
                 try:
-                    framebuffer.read_into(pack,components=3,alignment=1)
+                    output.read_into(pack)
                 except BaseException:
                     pack.release();raise
-                finally:framebuffer.release()
-                out=PendingReadback(pack,(w,h),False,exposure,params,histogram)
+                out=PendingReadback(pack,(w,h),False,exposure,params,histogram,output_check)
+                buffers.remove(output_check)
                 buffers.remove(histogram)
                 buffers.remove(exposure)
                 timings['readback_enqueue']=time.perf_counter()-t
             else:
-                try:raw=framebuffer.read(components=3,alignment=1)
-                finally:framebuffer.release()
+                raw=output.read()
                 check_black=int.from_bytes(histogram.read(size=4,offset=4096*4),'little')>16
-                out=ReadbackPixels(raw,(w,h),check_black).image()
+                if check_black and int.from_bytes(output_check.read(),'little')==0:raise RuntimeError('GPU 输出全黑，已停止保存')
+                out=ReadbackPixels(raw,(w,h),False).image()
                 values=np.frombuffer(exposure.read(),np.float32)
                 params.update(exposure_ev=float(values[0]),brightness_quantiles=values[1:4].tolist())
                 timings['readback']=time.perf_counter()-t
@@ -553,7 +579,7 @@ def run_pipeline(jobs,engine,args,renderer):
                 result,dest,record=item
                 converting=time.perf_counter()
                 if isinstance(result,ReadbackPixels):result=result.image()
-                sample('rgb_unpack_check',time.perf_counter()-converting)
+                sample('rgbx_wrap_check',time.perf_counter()-converting)
                 t=time.perf_counter()
                 dest.parent.mkdir(parents=True,exist_ok=True)
                 result.save(dest,format='JPEG',quality=85,subsampling=2,icc_profile=srgb)
