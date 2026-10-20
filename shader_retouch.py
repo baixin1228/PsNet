@@ -40,7 +40,7 @@ vec4 s=vec4(0);float w=0;for(int i=-12;i<=12;i++){float t=float(i)/12.;float k=e
 COEFF = shader('''void main(){pos=ivec2(gl_GlobalInvocationID.xy);sz=imageSize(src);if(any(greaterThanEqual(pos,sz)))return;
 vec2 m=fetch(pos).rg;float v=max(m.y-m.x*m.x,0);float a=v/(v+.12);float b=(1-a)*m.x;imageStore(dst,pos,vec4(a,b,0,1));}''')
 TONE = shader('''layout(rgba8,binding=2) readonly uniform image2D original;
-uniform float shoulder;uniform float exposure;uniform float shadow;uniform float highlight;uniform float contrast;uniform float clarity;
+uniform float look_rolloff;uniform float exposure;uniform float shadow;uniform float highlight;uniform float contrast;uniform float clarity;
 void main(){pos=ivec2(gl_GlobalInvocationID.xy);sz=imageSize(original);if(any(greaterThanEqual(pos,sz)))return;
 vec3 c=linearize(imageLoad(original,pos).rgb)*exp2(exposure);float y=max(lum(c),1e-5);float l=log2(y);
 ivec2 gs=imageSize(src);vec2 uv=(vec2(pos)+.5)*vec2(gs)/vec2(sz)-.5;
@@ -50,10 +50,19 @@ float lift=shadow*2.0*(1.-smoothstep(-5.,-1.,base));
 float compress=highlight*max(base+1.5,0.);
 float outY=exp2(base+lift-compress+detail+clarity*clamp(detail,-.6,.6));
 c*=outY/y;
-// A bounded shoulder preserves headroom; contrast acts on display luminance.
-c=c/(1.+shoulder*c);vec3 s=encode(c);float sy=max(lum(s),1e-5);
-float ny=1./(1.+exp(-contrast*log(clamp(sy,.0001,.9999)/(1.-clamp(sy,.0001,.9999)))));
-s*=ny/sy;imageStore(dst,pos,vec4(s,1));}''')
+// Restore the original tonal look without clipping extended-range values.
+c=c/(1.+look_rolloff*c);
+// Keep linear extended-range values until the final color/output mapping.
+// Extend the existing contrast curve above .8 without clamping highlights.
+vec3 display=encode(c);float sy=max(lum(display),1e-5);
+float pivot=.8;
+float atPivot=1./(1.+exp(-contrast*log(pivot/(1.-pivot))));
+float slope=contrast*atPivot*(1.-atPivot)/(pivot*(1.-pivot));
+float ny;
+if(sy<pivot){float v=clamp(sy,.0001,.9999);ny=1./(1.+exp(-contrast*log(v/(1.-v))));}
+else ny=atPivot+slope*(sy-pivot);
+display*=ny/sy;
+imageStore(dst,pos,vec4(linearize(display),1));}''')
 COLOR = shader('''uniform float saturation;uniform float split;uniform float stylize;
 float angleDelta(float a,float b){return atan(sin(a-b),cos(a-b));}
 float hueWeight(float h,float center,float width){float d=angleDelta(h,center)/width;return exp(-.5*d*d);}
@@ -61,7 +70,7 @@ vec3 toLab(vec3 c){vec3 v=mat3(.4122214708,.2119034982,.0883024619,.5363325363,.
 v=pow(max(v,vec3(0)),vec3(1./3.));return mat3(.2104542553,1.9779984951,.0259040371,.7936177850,-2.4285922050,.7827717662,-.0040720468,.4505937099,-.8086757660)*v;}
 vec3 fromLab(vec3 c){vec3 v=mat3(1.,1.,1.,.3963377774,-.1055613458,-.0894841775,.2158037573,-.0638541728,-1.2914855480)*c;v=v*v*v;return mat3(4.0767416621,-1.2684380046,-.0041960863,-3.3077115913,2.6097574011,-.7034186147,.2309699292,-.3413193965,1.7076147010)*v;}
 void main(){pos=ivec2(gl_GlobalInvocationID.xy);sz=imageSize(src);if(any(greaterThanEqual(pos,sz)))return;
-vec3 lab=toLab(linearize(max(fetch(pos).rgb,vec3(0))));float chroma=length(lab.yz);
+vec3 lab=toLab(max(fetch(pos).rgb,vec3(0)));float chroma=length(lab.yz);
 float protection=smoothstep(.02,.18,lab.x)*(1.-smoothstep(.88,1.,lab.x));
 lab.yz*=1.+saturation*(1.-.65*smoothstep(.08,.28,chroma))*protection;
 float hue=atan(lab.z,lab.y);float blue=exp(-pow((hue+1.5)/.65,2.));lab.x-=saturation*.035*blue*protection;
@@ -90,16 +99,36 @@ if(stylize>0.){
  lab.x+=k*light/norm;
  lab.yz=C*vec2(cos(h),sin(h));
 }
-// Compress chroma toward a neutral of the same lightness, instead of clipping channels.
-vec3 c=fromLab(lab);if(any(lessThan(c,vec3(0)))||any(greaterThan(c,vec3(1)))){float lo=0.,hi=1.;for(int i=0;i<10;i++){float m=(lo+hi)*.5;vec3 t=fromLab(vec3(lab.x,lab.yz*m));if(all(greaterThanEqual(t,vec3(0)))&&all(lessThanEqual(t,vec3(1))))lo=m;else hi=m;}c=fromLab(vec3(lab.x,lab.yz*lo));}
-imageStore(dst,pos,vec4(clamp(encode(c),0.,1.),1));}''')
+// Preserve linear extended-range color for final SDR mapping.
+imageStore(dst,pos,vec4(fromLab(lab),1));}''')
+MAP = COLOR.split('void main(){',1)[0]+'''
+void main(){pos=ivec2(gl_GlobalInvocationID.xy);sz=imageSize(src);if(any(greaterThanEqual(pos,sz)))return;
+vec3 c=fetch(pos).rgb;float y=max(lum(c),0.);
+// Identity in shadows/midtones; smoothly roll only the upper luminance range.
+float knee=.72;float ceiling=.995;
+if(y>knee){float mapped=knee+(ceiling-knee)*(1.-exp(-(y-knee)/(ceiling-knee)));c*=mapped/max(y,1e-5);}
+vec3 lab=toLab(c);
+// Bright highlights gently converge toward neutral, leaving midtone color intact.
+float highlight=smoothstep(.80,.99,max(lum(c),0.));
+lab.yz*=1.-.18*highlight;c=fromLab(lab);
+// Fit only this pixel's chroma to the SDR gamut; never darken the whole frame.
+if(any(lessThan(c,vec3(0)))||any(greaterThan(c,vec3(1)))){
+ float lo=0.,hi=1.;
+ for(int i=0;i<12;i++){float m=(lo+hi)*.5;vec3 t=fromLab(vec3(lab.x,lab.yz*m));
+ if(all(greaterThanEqual(t,vec3(0)))&&all(lessThanEqual(t,vec3(1))))lo=m;else hi=m;}
+ c=fromLab(vec3(lab.x,lab.yz*lo));
+}
+imageStore(dst,pos,vec4(clamp(encode(c),0.,1.),1));}'''
 SHARP = shader('''uniform float amount;
 void main(){pos=ivec2(gl_GlobalInvocationID.xy);sz=imageSize(src);if(any(greaterThanEqual(pos,sz)))return;
 vec3 c=fetch(pos).rgb;float y=lum(c);float blurred=0.;float weight=0.;
 for(int j=-1;j<=1;j++)for(int i=-1;i<=1;i++){float k=float((i==0?2:1)*(j==0?2:1));blurred+=lum(fetch(pos+ivec2(i,j)).rgb)*k;weight+=k;}
 float d=y-blurred/weight;
 float edge=smoothstep(.002,.015,abs(d));float gain=amount*edge*smoothstep(.02,.15,y);
-float ny=y+clamp(d,-.035,.035)*gain;c*=max(ny,0.)/max(y,1e-5);imageStore(dst,pos,vec4(clamp(c,0.,1.),1));}''').replace('layout(rgba16f,binding=1)', 'layout(rgba8,binding=1)')
+float adjustment=clamp(d,-.035,.035)*gain;
+float peak=max(c.r,max(c.g,c.b));
+if(adjustment>0.)adjustment=min(adjustment,max(0.,(1.-peak)*y/max(peak,1e-5))*.9);
+float ny=y+adjustment;c*=max(ny,0.)/max(y,1e-5);imageStore(dst,pos,vec4(clamp(c,0.,1.),1));}''').replace('layout(rgba16f,binding=1)', 'layout(rgba8,binding=1)')
 
 class Retoucher:
     def __init__(self, backend='auto'):
@@ -112,7 +141,7 @@ class Retoucher:
                 errors.append(str(e))
         else:
             raise RuntimeError('无法创建 OpenGL 4.3 上下文：'+'; '.join(errors))
-        self.programs={k:self.ctx.compute_shader(v) for k,v in dict(init=INIT,blur=BLUR,coeff=COEFF,tone=TONE,color=COLOR,sharp=SHARP).items()}
+        self.programs={k:self.ctx.compute_shader(v) for k,v in dict(init=INIT,blur=BLUR,coeff=COEFF,tone=TONE,color=COLOR,map=MAP,sharp=SHARP).items()}
 
     def dispatch(self, name, source, dest, extra=None, **uniforms):
         source.bind_to_image(0,read=True,write=False)
@@ -168,7 +197,7 @@ class Retoucher:
             stamp('guide',t)
             t=time.perf_counter()
             full=tex((w,h))
-            self.dispatch('tone',c,full,extra={2:original},shoulder=.22*strength,exposure=ev,**{k:params[k] for k in ['shadow','highlight','contrast','clarity']})
+            self.dispatch('tone',c,full,extra={2:original},look_rolloff=.22*strength,exposure=ev,**{k:params[k] for k in ['shadow','highlight','contrast','clarity']})
             stamp('tone',t)
             original.release();textures.remove(original)
             for buffer in [small,a,b,d]:buffer.release();textures.remove(buffer)
@@ -177,10 +206,13 @@ class Retoucher:
             colored=tex((w,h))
             self.dispatch('color',full,colored,saturation=params['saturation'],split=params['split'],stylize=min(strength,1.5) if stylize else 0.)
             stamp('color',t)
-            full.release();textures.remove(full)
+            t=time.perf_counter()
+            self.dispatch('map',colored,full)
+            stamp('output_sdr',t)
+            colored.release();textures.remove(colored)
             t=time.perf_counter()
             output=tex((w,h),dtype='f1')
-            self.dispatch('sharp',colored,output,amount=sharpness*strength)
+            self.dispatch('sharp',full,output,amount=sharpness*strength)
             stamp('sharp',t)
             t=time.perf_counter()
             result=np.frombuffer(output.read(),np.uint8).reshape(h,w,4)[:,:,:3].copy()
@@ -252,7 +284,7 @@ def main():
             save_started=time.perf_counter()
             result.save(dest,format="JPEG",quality=85,subsampling=2,icc_profile=srgb)
             save_seconds=time.perf_counter()-save_started
-            record=dict(algorithm='shader-retouch-v2.2',input=str(path),output=str(dest),size=list(image.size),style=args.style,stylize=args.stylize,strength=args.strength,sharpness=args.sharpness,exposure_offset=args.exposure,renderer=renderer,parameters=params,save_seconds=save_seconds,seconds=time.perf_counter()-start)
+            record=dict(algorithm='shader-retouch-v5',input=str(path),output=str(dest),size=list(image.size),style=args.style,stylize=args.stylize,strength=args.strength,sharpness=args.sharpness,exposure_offset=args.exposure,renderer=renderer,parameters=params,save_seconds=save_seconds,seconds=time.perf_counter()-start)
             if args.save_json:
                 metadata.write_text(json.dumps(record,ensure_ascii=False,indent=2),encoding='utf-8')
             print(f'完成 {record["seconds"]:.2f}s: {dest}')
