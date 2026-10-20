@@ -54,7 +54,9 @@ c*=outY/y;
 c=c/(1.+shoulder*c);vec3 s=encode(c);float sy=max(lum(s),1e-5);
 float ny=1./(1.+exp(-contrast*log(clamp(sy,.0001,.9999)/(1.-clamp(sy,.0001,.9999)))));
 s*=ny/sy;imageStore(dst,pos,vec4(s,1));}''')
-COLOR = shader('''uniform float saturation;uniform float split;
+COLOR = shader('''uniform float saturation;uniform float split;uniform float stylize;
+float angleDelta(float a,float b){return atan(sin(a-b),cos(a-b));}
+float hueWeight(float h,float center,float width){float d=angleDelta(h,center)/width;return exp(-.5*d*d);}
 vec3 toLab(vec3 c){vec3 v=mat3(.4122214708,.2119034982,.0883024619,.5363325363,.6806995451,.2817188376,.0514459929,.1073969566,.6299787005)*c;
 v=pow(max(v,vec3(0)),vec3(1./3.));return mat3(.2104542553,1.9779984951,.0259040371,.7936177850,-2.4285922050,.7827717662,-.0040720468,.4505937099,-.8086757660)*v;}
 vec3 fromLab(vec3 c){vec3 v=mat3(1.,1.,1.,.3963377774,-.1055613458,-.0894841775,.2158037573,-.0638541728,-1.2914855480)*c;v=v*v*v;return mat3(4.0767416621,-1.2684380046,-.0041960863,-3.3077115913,2.6097574011,-.7034186147,.2309699292,-.3413193965,1.7076147010)*v;}
@@ -64,6 +66,20 @@ float protection=smoothstep(.02,.18,lab.x)*(1.-smoothstep(.88,1.,lab.x));
 lab.yz*=1.+saturation*(1.-.65*smoothstep(.08,.28,chroma))*protection;
 float hue=atan(lab.z,lab.y);float blue=exp(-pow((hue+1.5)/.65,2.));lab.x-=saturation*.035*blue*protection;
 lab.y+=split*.10;lab.z+=split*.35*(2.*smoothstep(.25,.85,lab.x)-1.);
+// Optional smooth palette shaping; never quantize hues or tint neutral pixels.
+if(stylize>0.){
+ float C=length(lab.yz);float h=atan(lab.z,lab.y);
+ float mask=smoothstep(.025,.085,C)*smoothstep(.12,.30,lab.x)*(1.-smoothstep(.85,.98,lab.x));
+ // Soft color-range skin protection is approximate (not semantic face detection).
+ float skin=hueWeight(h,.88,.42)*smoothstep(.25,.45,lab.x)*(1.-smoothstep(.85,.98,lab.x));
+ float k=stylize*mask*(1.-.85*skin);
+ float green=hueWeight(h,2.30,.48);float blue=hueWeight(h,-1.78,.42);float purple=hueWeight(h,-.85,.38);
+ float shift=.28*green*angleDelta(2.53,h)+.24*blue*angleDelta(-1.98,h)+.30*purple*angleDelta(-.88,h);
+ h+=k*shift;
+ float gain=1.+k*(.12*green+.16*blue+.12*purple)*(1.-smoothstep(.16,.30,C));
+ C*=gain;lab.x+=k*(-.018*blue+.008*purple);
+ lab.yz=C*vec2(cos(h),sin(h));
+}
 // Compress chroma toward a neutral of the same lightness, instead of clipping channels.
 vec3 c=fromLab(lab);if(any(lessThan(c,vec3(0)))||any(greaterThan(c,vec3(1)))){float lo=0.,hi=1.;for(int i=0;i<10;i++){float m=(lo+hi)*.5;vec3 t=fromLab(vec3(lab.x,lab.yz*m));if(all(greaterThanEqual(t,vec3(0)))&&all(lessThanEqual(t,vec3(1))))lo=m;else hi=m;}c=fromLab(vec3(lab.x,lab.yz*lo));}
 imageStore(dst,pos,vec4(clamp(encode(c),0.,1.),1));}''')
@@ -99,7 +115,7 @@ class Retoucher:
         p.run((dest.width+15)//16,(dest.height+15)//16)
         self.ctx.memory_barrier()
 
-    def process(self, image, style, strength, exposure_offset, sharpness):
+    def process(self, image, style, strength, exposure_offset, sharpness, stylize=False):
         # Only small-image statistics run on CPU; all full-resolution enhancement runs in shaders.
         thumb=image.copy();thumb.thumbnail((256,256))
         rgb=np.asarray(thumb,dtype=np.float32)/255
@@ -149,7 +165,7 @@ class Retoucher:
             c.release();textures.remove(c)
             t=time.perf_counter()
             colored=tex((w,h))
-            self.dispatch('color',full,colored,saturation=params['saturation'],split=params['split'])
+            self.dispatch('color',full,colored,saturation=params['saturation'],split=params['split'],stylize=min(strength,1.5) if stylize else 0.)
             stamp('color',t)
             full.release();textures.remove(full)
             t=time.perf_counter()
@@ -179,6 +195,7 @@ def main():
     ap.add_argument('--max-size',type=int,default=0,help='最长边；0 保留原尺寸，256 适合当前小图训练')
     ap.add_argument('--recursive',action='store_true',help='递归目录，保留子目录结构')
     ap.add_argument('--overwrite',action='store_true')
+    ap.add_argument('--stylize',action='store_true',help='开启额外色相塑形：绿/蓝/紫归拢及选择性色度增强；默认关闭')
     ap.add_argument('--save-json',action='store_true',help='显式保存同名 JSON 参数记录，默认不输出')
     ap.add_argument('--backend',choices=['auto','egl','default'],default='auto')
     ap.add_argument('--allow-software',action='store_true',help='允许 Mesa 软件渲染，仅用于测试')
@@ -218,14 +235,14 @@ def main():
                 image=ImageOps.exif_transpose(im).convert('RGB')
             if args.max_size:image.thumbnail((args.max_size,args.max_size),Image.Resampling.LANCZOS)
             if args.strength==0:result,params=image.copy(),{}
-            else:result,params=engine.process(image,args.style,args.strength,args.exposure,args.sharpness)
+            else:result,params=engine.process(image,args.style,args.strength,args.exposure,args.sharpness,stylize=args.stylize)
             dest.parent.mkdir(parents=True,exist_ok=True)
             from PIL import ImageCms
             srgb=ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB')).tobytes()
             save_started=time.perf_counter()
             result.save(dest,format="JPEG",quality=85,subsampling=2,icc_profile=srgb)
             save_seconds=time.perf_counter()-save_started
-            record=dict(algorithm='shader-retouch-v2',input=str(path),output=str(dest),size=list(image.size),style=args.style,strength=args.strength,sharpness=args.sharpness,exposure_offset=args.exposure,renderer=renderer,parameters=params,save_seconds=save_seconds,seconds=time.perf_counter()-start)
+            record=dict(algorithm='shader-retouch-v2.1',input=str(path),output=str(dest),size=list(image.size),style=args.style,stylize=args.stylize,strength=args.strength,sharpness=args.sharpness,exposure_offset=args.exposure,renderer=renderer,parameters=params,save_seconds=save_seconds,seconds=time.perf_counter()-start)
             if args.save_json:
                 metadata.write_text(json.dumps(record,ensure_ascii=False,indent=2),encoding='utf-8')
             print(f'完成 {record["seconds"]:.2f}s: {dest}')
